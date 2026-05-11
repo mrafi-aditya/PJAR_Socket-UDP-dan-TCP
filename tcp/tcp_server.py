@@ -24,10 +24,10 @@ def broadcast(message, sender_socket=None):
 
 def handle_client(client_socket, address):
     try:
-        client_socket.send("Username: ".encode())
+        client_socket.send("Username:\n".encode())
         username = client_socket.recv(1024).decode().strip()
 
-        client_socket.send("Password: ".encode())
+        client_socket.send("Password:\n".encode())
         password = client_socket.recv(1024).decode().strip()
 
         if username not in users or users[username] != password:
