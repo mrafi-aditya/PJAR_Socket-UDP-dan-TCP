@@ -39,18 +39,20 @@ Project ini berisi implementasi socket programming menggunakan Python.
 
 ```bash
 python udp/udp_server.py
+```
 
 ```bash
 python udp/udp_client.py
+```
 
 ### TPC Server/Client
 
 ```bash
 python tcp/tcp_server.py
-
+```
 ```bash
 python tcp/tcp_client.py
-
+```
 ## Konfigurasi IP
 
 ### Pada file client, ubah SERVER_IP sesuai IP server VirtualBox.
