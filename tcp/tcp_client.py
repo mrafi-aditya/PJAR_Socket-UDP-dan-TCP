@@ -2,7 +2,7 @@
 import socket
 import threading
 
-SERVER_IP = "192.168.56.101"  # ganti dengan IP VirtualBox server
+SERVER_IP = "192.168.18.99"  # ganti dengan IP VirtualBox server
 SERVER_PORT = 6000
 
 client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
