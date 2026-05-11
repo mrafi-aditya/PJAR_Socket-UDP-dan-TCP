@@ -412,21 +412,6 @@ Program memiliki beberapa error handling sederhana, seperti:
 
 ---
 
-# Screenshot Program
-
-Tambahkan screenshot berikut:
-
-1. UDP Server Running
-2. UDP Multi Client Chat
-3. TCP Login Berhasil
-4. TCP Multi Client Chat
-5. TCP Command `/list`
-6. TCP Pengiriman File
-7. Isi folder `received_files`
-8. Isi file `udp_chat.log`
-
----
-
 # Kesimpulan
 
 Project ini berhasil mengimplementasikan socket programming menggunakan protokol UDP dan TCP dengan fitur multi-client communication, autentikasi sederhana, pengiriman file, logging, dan command system.
