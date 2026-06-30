@@ -34,12 +34,34 @@ clients: dict[tuple[str, int], str] = {}
 
 
 def get_local_ip() -> str:
-    """Mengambil IP lokal tanpa bergantung pada koneksi internet."""
+    """Mengambil IP lokal server agar mudah dipakai client dari Windows/host.
+
+    Server tetap bind ke 0.0.0.0, sedangkan IP ini hanya ditampilkan
+    supaya client tahu alamat Ubuntu VirtualBox yang harus dituju.
+    """
+    candidates: list[str] = []
+
+    # Cara paling stabil untuk mengetahui IP interface aktif.
+    for target in ("8.8.8.8", "1.1.1.1"):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+                probe.connect((target, 80))
+                candidates.append(probe.getsockname()[0])
+        except OSError:
+            pass
+
+    # Cadangan jika cara di atas gagal.
     try:
-        ip_address = socket.gethostbyname(socket.gethostname())
-        return ip_address if ip_address else "127.0.0.1"
+        hostname = socket.gethostname()
+        for info in socket.getaddrinfo(hostname, None, socket.AF_INET):
+            candidates.append(info[4][0])
     except OSError:
-        return "127.0.0.1"
+        pass
+
+    for ip_address in candidates:
+        if ip_address and not ip_address.startswith("127."):
+            return ip_address
+    return "127.0.0.1"
 
 
 def send(server: socket.socket, address: tuple[str, int], message: str) -> None:
@@ -129,10 +151,12 @@ def run_server(host: str, port: int) -> None:
         print("=" * 55)
         print(" UDP BROADCAST CHAT SERVER")
         print("=" * 55)
-        print(f"Bind address : {host}:{port}")
-        print(f"IP lokal     : {get_local_ip()}")
-        print("Client lokal : python udp/udp_client.py --host 127.0.0.1")
-        print("Stop server  : CTRL + C")
+        local_ip = get_local_ip()
+        print(f"Bind address       : {host}:{port}")
+        print(f"IP Ubuntu VBox     : {local_ip}")
+        print(f"Client dari Windows: python udp/udp_client.py --host {local_ip} --port {port}")
+        print("Client di server   : python udp/udp_client.py --host 127.0.0.1")
+        print("Stop server        : CTRL + C")
         print("=" * 55)
 
         while True:

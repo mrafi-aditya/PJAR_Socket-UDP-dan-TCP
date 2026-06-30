@@ -1,7 +1,7 @@
 """UDP Broadcast Chat Client.
 
-Default host menggunakan 127.0.0.1 agar mudah demo di laptop sendiri,
-bukan IP VirtualBox. Jika beda device, isi dengan IP lokal server.
+Default host diarahkan ke IP server Ubuntu VirtualBox.
+Jika IP VirtualBox berubah, jalankan client dengan opsi --host IP_SERVER.
 """
 
 import argparse
@@ -9,7 +9,7 @@ import re
 import socket
 import threading
 
-DEFAULT_HOST = "127.0.0.1"
+DEFAULT_HOST = "192.168.18.99"  # IP Ubuntu VirtualBox. Ubah via --host jika IP berubah.
 DEFAULT_PORT = 5000
 BUFFER_SIZE = 2048
 USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_]{3,20}$")
@@ -95,7 +95,7 @@ def run_client(host: str, port: int) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="UDP Broadcast Chat Client")
-    parser.add_argument("--host", default=DEFAULT_HOST, help="IP server, default 127.0.0.1")
+    parser.add_argument("--host", default=DEFAULT_HOST, help="IP server Ubuntu VirtualBox, default 192.168.18.99")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="Port server, default 5000")
     args = parser.parse_args()
     run_client(args.host, args.port)

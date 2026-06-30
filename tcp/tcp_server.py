@@ -21,7 +21,30 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
-from protocol import read_json_line, send_json
+
+
+
+def send_json(sock: socket.socket, payload: dict) -> None:
+    """Mengirim data JSON lewat TCP tanpa file protocol.py.
+
+    TCP tidak punya batas pesan seperti UDP, jadi setiap JSON diakhiri newline.
+    Newline dipakai sebagai pemisah antar pesan agar penerima mudah membaca
+    satu pesan utuh per baris.
+    """
+    data = json.dumps(payload, ensure_ascii=False) + "\n"
+    sock.sendall(data.encode("utf-8"))
+
+
+def read_json_line(reader):
+    """Membaca satu baris JSON dari koneksi TCP.
+
+    Return None jika koneksi client/server terputus.
+    """
+    line = reader.readline()
+    if not line:
+        return None
+    return json.loads(line)
+
 
 DEFAULT_HOST = "0.0.0.0"  # Server menerima koneksi dari semua interface jaringan.
 DEFAULT_PORT = 6000
@@ -53,12 +76,34 @@ clients_lock = threading.Lock()
 
 
 def get_local_ip() -> str:
-    """Mengambil IP lokal tanpa bergantung pada koneksi internet."""
+    """Mengambil IP lokal server agar mudah dipakai client dari Windows/host.
+
+    Server tetap bind ke 0.0.0.0, sedangkan IP ini hanya ditampilkan
+    supaya client tahu alamat Ubuntu VirtualBox yang harus dituju.
+    """
+    candidates: list[str] = []
+
+    # Cara paling stabil untuk mengetahui IP interface aktif.
+    for target in ("8.8.8.8", "1.1.1.1"):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+                probe.connect((target, 80))
+                candidates.append(probe.getsockname()[0])
+        except OSError:
+            pass
+
+    # Cadangan jika cara di atas gagal.
     try:
-        ip_address = socket.gethostbyname(socket.gethostname())
-        return ip_address if ip_address else "127.0.0.1"
+        hostname = socket.gethostname()
+        for info in socket.getaddrinfo(hostname, None, socket.AF_INET):
+            candidates.append(info[4][0])
     except OSError:
-        return "127.0.0.1"
+        pass
+
+    for ip_address in candidates:
+        if ip_address and not ip_address.startswith("127."):
+            return ip_address
+    return "127.0.0.1"
 
 
 def safe_filename(filename: str) -> str:
@@ -281,11 +326,13 @@ def run_server(host: str, port: int) -> None:
         print("=" * 55)
         print(" TCP MULTI CLIENT CHAT SERVER")
         print("=" * 55)
-        print(f"Bind address : {host}:{port}")
-        print(f"IP lokal     : {get_local_ip()}")
-        print("Client lokal : python tcp/tcp_client.py --host 127.0.0.1")
-        print("Akun demo    : admin/123, user1/123, user2/123")
-        print("Stop server  : CTRL + C")
+        local_ip = get_local_ip()
+        print(f"Bind address       : {host}:{port}")
+        print(f"IP Ubuntu VBox     : {local_ip}")
+        print(f"Client dari Windows: python tcp/tcp_client.py --host {local_ip} --port {port}")
+        print("Client di server   : python tcp/tcp_client.py --host 127.0.0.1")
+        print("Akun demo          : admin/123, user1/123, user2/123")
+        print("Stop server        : CTRL + C")
         print("=" * 55)
 
         while True:

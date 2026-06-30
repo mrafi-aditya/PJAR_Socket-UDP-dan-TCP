@@ -1,7 +1,7 @@
 """TCP Multi Client Chat Client.
 
-Default host menggunakan 127.0.0.1 agar tidak bergantung pada IP VirtualBox.
-Untuk beda laptop/jaringan, jalankan client dengan --host IP_SERVER.
+Default host diarahkan ke IP server Ubuntu VirtualBox.
+Jika IP VirtualBox berubah, jalankan client dengan opsi --host IP_SERVER.
 """
 
 from __future__ import annotations
@@ -9,13 +9,37 @@ from __future__ import annotations
 import argparse
 import base64
 import getpass
+import json
 import socket
 import threading
 from pathlib import Path
 
-from protocol import read_json_line, send_json
 
-DEFAULT_HOST = "127.0.0.1"
+
+
+def send_json(sock: socket.socket, payload: dict) -> None:
+    """Mengirim data JSON lewat TCP tanpa file protocol.py.
+
+    TCP tidak punya batas pesan seperti UDP, jadi setiap JSON diakhiri newline.
+    Newline dipakai sebagai pemisah antar pesan agar penerima mudah membaca
+    satu pesan utuh per baris.
+    """
+    data = json.dumps(payload, ensure_ascii=False) + "\n"
+    sock.sendall(data.encode("utf-8"))
+
+
+def read_json_line(reader):
+    """Membaca satu baris JSON dari koneksi TCP.
+
+    Return None jika koneksi client/server terputus.
+    """
+    line = reader.readline()
+    if not line:
+        return None
+    return json.loads(line)
+
+
+DEFAULT_HOST = "192.168.18.99"  # IP Ubuntu VirtualBox. Ubah via --host jika IP berubah.
 DEFAULT_PORT = 6000
 MAX_FILE_SIZE = 2 * 1024 * 1024  # 2 MB
 
@@ -153,7 +177,7 @@ def run_client(host: str, port: int) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="TCP Multi Client Chat Client")
-    parser.add_argument("--host", default=DEFAULT_HOST, help="IP server, default 127.0.0.1")
+    parser.add_argument("--host", default=DEFAULT_HOST, help="IP server Ubuntu VirtualBox, default 192.168.18.99")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="Port server, default 6000")
     args = parser.parse_args()
     run_client(args.host, args.port)
