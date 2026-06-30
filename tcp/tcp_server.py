@@ -172,6 +172,10 @@ def handle_private_message(username, target, text):
 
 
 def handle_file(username, payload):
+    """Menerima file dari client dan menyimpannya.
+
+    Semua error file dibalas ke client, bukan memutus koneksi client.
+    """
     filename = safe_filename(str(payload.get("filename", "file.txt")))
     content_b64 = payload.get("content_b64", "")
 
@@ -191,7 +195,13 @@ def handle_file(username, payload):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     saved_name = f"{timestamp}_{username}_{filename}"
     save_path = RECEIVED_DIR / saved_name
-    save_path.write_bytes(content)
+
+    try:
+        save_path.write_bytes(content)
+    except OSError as error:
+        send_to_user(username, {"type": "error", "text": f"Server gagal menyimpan file: {error}"})
+        logging.exception("TCP gagal menyimpan file")
+        return
 
     size_kb = len(content) / 1024
     info = f"File '{filename}' dari {username} tersimpan sebagai '{saved_name}' ({size_kb:.1f} KB)."

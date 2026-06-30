@@ -7,6 +7,7 @@ import argparse
 import base64
 import getpass
 import json
+import shlex
 import socket
 import threading
 from pathlib import Path
@@ -64,30 +65,62 @@ def receive_messages(reader, stop_event):
 
 
 def send_file(sock, filepath):
-    """Membaca file lokal lalu mengirimnya ke server."""
-    cleaned_path = filepath.strip().strip('"').strip("'")
+    """Membaca file lokal lalu mengirimnya ke server.
+
+    Return True hanya jika paket file berhasil dikirim ke socket.
+    Return False untuk kesalahan lokal, misalnya path salah, file kosong,
+    atau file terlalu besar. Kesalahan lokal tidak boleh membuat client logout.
+    """
+    cleaned_path = (filepath or "").strip().strip('"').strip("'")
+    if not cleaned_path:
+        print("Format: /sendfile path_file")
+        print("Contoh: /sendfile ../files/msg.txt")
+        return False
+
+    # Mencegah user menyalin teks bantuan secara utuh:
+    # /sendfile path     : kirim file ke server
+    if cleaned_path.lower().startswith("path") and ":" in cleaned_path:
+        print("[CLIENT] Jangan ketik teks penjelasannya. Ganti 'path' dengan lokasi file asli.")
+        print("Contoh: /sendfile ../files/msg.txt")
+        return False
+
     path = Path(cleaned_path).expanduser()
 
-    if not path.is_file():
-        print("[CLIENT] File tidak ditemukan.")
-        return
+    try:
+        if not path.exists():
+            print(f"[CLIENT] File tidak ditemukan: {cleaned_path}")
+            print("Tips: jika terminal sedang di folder tcp, gunakan: /sendfile ../files/msg.txt")
+            return False
+        if not path.is_file():
+            print(f"[CLIENT] Path bukan file: {cleaned_path}")
+            return False
 
-    size = path.stat().st_size
-    if size == 0:
-        print("[CLIENT] File kosong tidak dikirim.")
-        return
-    if size > MAX_FILE_SIZE:
-        print("[CLIENT] File terlalu besar. Maksimal 2 MB.")
-        return
+        size = path.stat().st_size
+        if size == 0:
+            print("[CLIENT] File kosong tidak dikirim.")
+            return False
+        if size > MAX_FILE_SIZE:
+            print("[CLIENT] File terlalu besar. Maksimal 2 MB.")
+            return False
 
-    content_b64 = base64.b64encode(path.read_bytes()).decode("ascii")
-    send_json(sock, {
-        "type": "file",
-        "filename": path.name,
-        "size": size,
-        "content_b64": content_b64,
-    })
+        content_b64 = base64.b64encode(path.read_bytes()).decode("ascii")
+    except OSError as error:
+        print(f"[CLIENT] Gagal membaca file: {error}")
+        return False
+
+    try:
+        send_json(sock, {
+            "type": "file",
+            "filename": path.name,
+            "size": size,
+            "content_b64": content_b64,
+        })
+    except OSError as error:
+        print(f"[CLIENT] Gagal mengirim file ke server: {error}")
+        return False
+
     print(f"[CLIENT] Mengirim file {path.name} ({size / 1024:.1f} KB).")
+    return True
 
 
 def run_client(host, port):
@@ -147,9 +180,24 @@ def run_client(host, port):
                         print("Format: /msg username pesan")
                     else:
                         send_json(sock, {"type": "private", "target": parts[1], "text": parts[2]})
+                elif message == "/sendfile":
+                    print("Format: /sendfile path_file")
+                    print("Contoh dari folder tcp: /sendfile ../files/msg.txt")
                 elif message.startswith("/sendfile "):
-                    filepath = message.split(" ", 1)[1]
-                    send_file(sock, filepath)
+                    # shlex membuat path yang memakai spasi bisa ditulis dengan tanda kutip.
+                    # Contoh: /sendfile "../files/contoh file.txt"
+                    try:
+                        parts = shlex.split(message)
+                    except ValueError as error:
+                        print(f"[CLIENT] Format path tidak valid: {error}")
+                        continue
+
+                    if len(parts) != 2:
+                        print("Format: /sendfile path_file")
+                        print("Contoh: /sendfile ../files/msg.txt")
+                        continue
+
+                    send_file(sock, parts[1])
                 elif message == "/quit":
                     send_json(sock, {"type": "quit"})
                     stop_event.set()
