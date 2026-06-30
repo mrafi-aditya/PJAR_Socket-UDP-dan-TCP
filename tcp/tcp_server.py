@@ -1,101 +1,313 @@
-# tcp/tcp_server.py
+"""TCP Multi Client Chat Server.
+
+Fitur:
+- Multi-client dengan threading.
+- Login username/password.
+- Chat real-time.
+- Command /list, /msg, /help, /quit.
+- Terima file dari client dan simpan ke folder received_files.
+- Logging ke logs/tcp_chat.log.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import logging
+import re
 import socket
 import threading
-import os
+from datetime import datetime
+from pathlib import Path
 
-HOST = "0.0.0.0"
-PORT = 6000
+from protocol import read_json_line, send_json
 
-users = {
+DEFAULT_HOST = "0.0.0.0"  # Server menerima koneksi dari semua interface jaringan.
+DEFAULT_PORT = 6000
+MAX_MESSAGE_LENGTH = 1000
+MAX_FILE_SIZE = 2 * 1024 * 1024  # 2 MB agar aman untuk demo tugas.
+USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_]{3,20}$")
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+LOG_DIR = BASE_DIR / "logs"
+RECEIVED_DIR = BASE_DIR / "received_files"
+LOG_DIR.mkdir(exist_ok=True)
+RECEIVED_DIR.mkdir(exist_ok=True)
+
+logging.basicConfig(
+    filename=LOG_DIR / "tcp_chat.log",
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
+
+USERS = {
     "admin": "123",
     "user1": "123",
-    "user2": "123"
+    "user2": "123",
 }
 
-clients = {}
+clients: dict[str, socket.socket] = {}
+client_addresses: dict[str, tuple[str, int]] = {}
+clients_lock = threading.Lock()
 
-def broadcast(message, sender_socket=None):
-    for client_socket in clients:
-        if client_socket != sender_socket:
-            try:
-                client_socket.send(message.encode())
-            except:
-                pass
 
-def handle_client(client_socket, address):
+def get_local_ip() -> str:
+    """Mengambil IP lokal tanpa bergantung pada koneksi internet."""
     try:
-        client_socket.send("Username:\n".encode())
-        username = client_socket.recv(1024).decode().strip()
+        ip_address = socket.gethostbyname(socket.gethostname())
+        return ip_address if ip_address else "127.0.0.1"
+    except OSError:
+        return "127.0.0.1"
 
-        client_socket.send("Password:\n".encode())
-        password = client_socket.recv(1024).decode().strip()
 
-        if username not in users or users[username] != password:
-            client_socket.send("Login gagal.\n".encode())
-            client_socket.close()
+def safe_filename(filename: str) -> str:
+    """Membersihkan nama file agar tidak bisa keluar dari folder tujuan."""
+    name = Path(filename).name.strip() or "file_tanpa_nama"
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", name)
+
+
+def send_to_user(username: str, payload: dict) -> bool:
+    """Mengirim payload ke user tertentu."""
+    with clients_lock:
+        sock = clients.get(username)
+    if not sock:
+        return False
+    try:
+        send_json(sock, payload)
+        return True
+    except OSError as error:
+        print(f"[ERROR] Gagal mengirim ke {username}: {error}")
+        return False
+
+
+def broadcast(payload: dict, exclude: str | None = None) -> None:
+    """Broadcast pesan ke semua client aktif."""
+    with clients_lock:
+        online = list(clients.items())
+
+    for username, sock in online:
+        if username == exclude:
+            continue
+        try:
+            send_json(sock, payload)
+        except OSError as error:
+            print(f"[ERROR] Broadcast gagal ke {username}: {error}")
+
+
+def online_users() -> list[str]:
+    with clients_lock:
+        return sorted(clients.keys())
+
+
+def validate_login(username: str, password: str) -> tuple[bool, str]:
+    """Validasi login sederhana."""
+    if not USERNAME_PATTERN.match(username):
+        return False, "Username harus 3-20 karakter, hanya huruf/angka/underscore."
+    if USERS.get(username) != password:
+        return False, "Username atau password salah."
+    with clients_lock:
+        if username in clients:
+            return False, "Username sedang login di client lain."
+    return True, "Login berhasil."
+
+
+def handle_chat(username: str, text: str) -> None:
+    """Memproses chat biasa dari client."""
+    text = text.strip()
+    if not text:
+        send_to_user(username, {"type": "error", "text": "Pesan tidak boleh kosong."})
+        return
+    if len(text) > MAX_MESSAGE_LENGTH:
+        send_to_user(username, {"type": "error", "text": f"Pesan maksimal {MAX_MESSAGE_LENGTH} karakter."})
+        return
+
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    message = f"[{timestamp}] {username}: {text}"
+    print(message)
+    logging.info("CHAT %s", message)
+    broadcast({"type": "chat", "text": message})
+
+
+def handle_private_message(username: str, target: str, text: str) -> None:
+    """Mengirim pesan private antar user."""
+    if not target or not text.strip():
+        send_to_user(username, {"type": "error", "text": "Format: /msg username pesan"})
+        return
+    if target == username:
+        send_to_user(username, {"type": "error", "text": "Tidak perlu mengirim private message ke diri sendiri."})
+        return
+
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    sent = send_to_user(target, {"type": "private", "text": f"[{timestamp}] [PM dari {username}] {text.strip()}"})
+    if sent:
+        send_to_user(username, {"type": "info", "text": f"[PM ke {target}] {text.strip()}"})
+        logging.info("PM %s -> %s: %s", username, target, text.strip())
+    else:
+        send_to_user(username, {"type": "error", "text": f"User {target} tidak online."})
+
+
+def handle_file(username: str, payload: dict) -> None:
+    """Menerima file base64 dari client lalu menyimpannya."""
+    filename = safe_filename(str(payload.get("filename", "file.txt")))
+    content_b64 = payload.get("content_b64", "")
+
+    try:
+        content = base64.b64decode(content_b64, validate=True)
+    except (ValueError, TypeError):
+        send_to_user(username, {"type": "error", "text": "File gagal dibaca: format base64 tidak valid."})
+        return
+
+    if len(content) == 0:
+        send_to_user(username, {"type": "error", "text": "File kosong tidak dikirim."})
+        return
+    if len(content) > MAX_FILE_SIZE:
+        send_to_user(username, {"type": "error", "text": "Ukuran file melebihi 2 MB."})
+        return
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    saved_name = f"{timestamp}_{username}_{filename}"
+    save_path = RECEIVED_DIR / saved_name
+    save_path.write_bytes(content)
+
+    size_kb = len(content) / 1024
+    info = f"File '{filename}' dari {username} tersimpan sebagai '{saved_name}' ({size_kb:.1f} KB)."
+    print(f"[FILE] {info}")
+    logging.info("FILE %s", info)
+    send_to_user(username, {"type": "info", "text": f"File berhasil dikirim: {saved_name}"})
+    broadcast({"type": "info", "text": f"[SERVER] {username} mengirim file: {filename}"}, exclude=username)
+
+
+def send_help(username: str) -> None:
+    """Mengirim daftar command ke client."""
+    help_text = (
+        "Command tersedia:\n"
+        "  /help              : bantuan command\n"
+        "  /list              : lihat user online\n"
+        "  /msg user pesan    : kirim pesan private\n"
+        "  /sendfile path     : kirim file ke server\n"
+        "  /quit              : keluar dari chat"
+    )
+    send_to_user(username, {"type": "info", "text": help_text})
+
+
+def cleanup_client(username: str | None) -> None:
+    """Menghapus client saat disconnect."""
+    if not username:
+        return
+    with clients_lock:
+        sock = clients.pop(username, None)
+        client_addresses.pop(username, None)
+    if sock:
+        try:
+            sock.close()
+        except OSError:
+            pass
+    broadcast({"type": "info", "text": f"[SERVER] {username} keluar dari TCP chat."}, exclude=username)
+    logging.info("LOGOUT %s", username)
+    print(f"[LOGOUT] {username}")
+
+
+def handle_client(conn: socket.socket, address: tuple[str, int]) -> None:
+    """Thread handler untuk satu client TCP."""
+    username: str | None = None
+    try:
+        reader = conn.makefile("r", encoding="utf-8")
+        send_json(conn, {"type": "info", "text": "Silakan login menggunakan username dan password."})
+
+        login_payload = read_json_line(reader)
+        if not login_payload or login_payload.get("type") != "login":
+            send_json(conn, {"type": "error", "text": "Payload login tidak valid."})
             return
 
-        clients[client_socket] = username
-        client_socket.send("Login berhasil.\n".encode())
+        username = str(login_payload.get("username", "")).strip()
+        password = str(login_payload.get("password", "")).strip()
+        valid, message = validate_login(username, password)
+        if not valid:
+            send_json(conn, {"type": "auth", "status": "failed", "text": message})
+            return
 
+        with clients_lock:
+            clients[username] = conn
+            client_addresses[username] = address
+
+        send_json(conn, {"type": "auth", "status": "ok", "text": message})
+        send_help(username)
+        broadcast({"type": "info", "text": f"[SERVER] {username} bergabung ke TCP chat."}, exclude=username)
+        logging.info("LOGIN %s %s", username, address)
         print(f"[LOGIN] {username} dari {address}")
-        broadcast(f"[SERVER] {username} bergabung ke chat.\n", client_socket)
 
         while True:
-            message = client_socket.recv(4096).decode().strip()
+            try:
+                payload = read_json_line(reader)
+            except json.JSONDecodeError:
+                send_to_user(username, {"type": "error", "text": "Format data tidak valid."})
+                continue
 
-            if not message:
+            if payload is None:
                 break
 
-            if message == "/quit":
+            msg_type = payload.get("type")
+            if msg_type == "chat":
+                handle_chat(username, str(payload.get("text", "")))
+            elif msg_type == "private":
+                handle_private_message(username, str(payload.get("target", "")).strip(), str(payload.get("text", "")))
+            elif msg_type == "list":
+                send_to_user(username, {"type": "info", "text": "User online: " + ", ".join(online_users())})
+            elif msg_type == "help":
+                send_help(username)
+            elif msg_type == "file":
+                handle_file(username, payload)
+            elif msg_type == "quit":
+                send_to_user(username, {"type": "info", "text": "Keluar dari TCP chat."})
                 break
-
-            elif message == "/list":
-                online_users = ", ".join(clients.values())
-                client_socket.send(f"User online: {online_users}\n".encode())
-
-            elif message.startswith("/sendfile"):
-                parts = message.split(" ", 2)
-
-                if len(parts) < 3:
-                    client_socket.send("Format: /sendfile nama_file isi_file\n".encode())
-                    continue
-
-                filename = parts[1]
-                content = parts[2]
-
-                os.makedirs("received_files", exist_ok=True)
-                filepath = os.path.join("received_files", filename)
-
-                with open(filepath, "w", encoding="utf-8") as file:
-                    file.write(content)
-
-                client_socket.send(f"File {filename} berhasil dikirim ke server.\n".encode())
-                print(f"[FILE] {username} mengirim {filename}")
-
             else:
-                chat_message = f"{username}: {message}\n"
-                print(chat_message.strip())
-                broadcast(chat_message, client_socket)
-
-    except Exception as e:
-        print(f"[ERROR] {address}: {e}")
-
+                send_to_user(username, {"type": "error", "text": "Command tidak dikenali. Ketik /help."})
+    except ConnectionResetError:
+        print(f"[DISCONNECT] Client {address} terputus tiba-tiba.")
+    except OSError as error:
+        print(f"[ERROR] Client {address}: {error}")
+        logging.exception("Client error")
     finally:
-        if client_socket in clients:
-            username = clients[client_socket]
-            del clients[client_socket]
-            broadcast(f"[SERVER] {username} keluar dari chat.\n")
+        cleanup_client(username)
 
-        client_socket.close()
 
-server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-server.bind((HOST, PORT))
-server.listen()
+def run_server(host: str, port: int) -> None:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind((host, port))
+        server.listen(10)
 
-print(f"[TCP SERVER] Running on {HOST}:{PORT}")
+        print("=" * 55)
+        print(" TCP MULTI CLIENT CHAT SERVER")
+        print("=" * 55)
+        print(f"Bind address : {host}:{port}")
+        print(f"IP lokal     : {get_local_ip()}")
+        print("Client lokal : python tcp/tcp_client.py --host 127.0.0.1")
+        print("Akun demo    : admin/123, user1/123, user2/123")
+        print("Stop server  : CTRL + C")
+        print("=" * 55)
 
-while True:
-    client_socket, address = server.accept()
-    thread = threading.Thread(target=handle_client, args=(client_socket, address))
-    thread.start()
+        while True:
+            try:
+                conn, address = server.accept()
+                thread = threading.Thread(target=handle_client, args=(conn, address), daemon=True)
+                thread.start()
+            except KeyboardInterrupt:
+                print("\n[SERVER] TCP server dihentikan.")
+                break
+            except OSError as error:
+                print(f"[ERROR] Server error: {error}")
+                logging.exception("Server error")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="TCP Multi Client Chat Server")
+    parser.add_argument("--host", default=DEFAULT_HOST, help="Alamat bind server, default 0.0.0.0")
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="Port server, default 6000")
+    args = parser.parse_args()
+    run_server(args.host, args.port)
+
+
+if __name__ == "__main__":
+    main()

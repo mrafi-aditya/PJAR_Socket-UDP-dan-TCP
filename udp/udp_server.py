@@ -1,44 +1,173 @@
-# udp/udp_server.py
-import socket
+"""UDP Broadcast Chat Server
+
+Fitur:
+- Menerima banyak client UDP.
+- Broadcast pesan ke semua client aktif.
+- Logging pesan ke file logs/udp_chat.log.
+- Validasi username dan pesan.
+"""
+
+import argparse
 import logging
+import re
+import socket
+from datetime import datetime
+from pathlib import Path
 
-HOST = "0.0.0.0"
-PORT = 5000
+DEFAULT_HOST = "0.0.0.0"  # Server menerima koneksi dari semua interface jaringan.
+DEFAULT_PORT = 5000
+BUFFER_SIZE = 2048
+MAX_MESSAGE_LENGTH = 500
+USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_]{3,20}$")
 
-clients = set()
+BASE_DIR = Path(__file__).resolve().parent.parent
+LOG_DIR = BASE_DIR / "logs"
+LOG_DIR.mkdir(exist_ok=True)
 
 logging.basicConfig(
-    filename="udp_chat.log",
+    filename=LOG_DIR / "udp_chat.log",
     level=logging.INFO,
-    format="%(asctime)s - %(message)s"
+    format="%(asctime)s - %(levelname)s - %(message)s",
 )
 
-server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-server.bind((HOST, PORT))
+clients: dict[tuple[str, int], str] = {}
 
-print(f"[UDP SERVER] Running on {HOST}:{PORT}")
 
-while True:
+def get_local_ip() -> str:
+    """Mengambil IP lokal tanpa bergantung pada koneksi internet."""
     try:
-        data, address = server.recvfrom(1024)
-        message = data.decode().strip()
+        ip_address = socket.gethostbyname(socket.gethostname())
+        return ip_address if ip_address else "127.0.0.1"
+    except OSError:
+        return "127.0.0.1"
 
-        if not message:
-            server.sendto("Pesan tidak boleh kosong.".encode(), address)
+
+def send(server: socket.socket, address: tuple[str, int], message: str) -> None:
+    """Mengirim pesan UDP dengan error handling sederhana."""
+    try:
+        server.sendto(message.encode("utf-8"), address)
+    except OSError as error:
+        print(f"[ERROR] Gagal mengirim ke {address}: {error}")
+
+
+def broadcast(server: socket.socket, message: str, exclude: tuple[str, int] | None = None) -> None:
+    """Mengirim pesan ke semua client, kecuali alamat tertentu jika ada."""
+    for address in list(clients.keys()):
+        if address == exclude:
             continue
+        send(server, address, message)
 
-        clients.add(address)
 
-        if ":" not in message:
-            server.sendto("Format salah. Gunakan username: pesan".encode(), address)
-            continue
+def is_valid_username(username: str) -> bool:
+    return bool(USERNAME_PATTERN.match(username))
 
-        print(f"[{address}] {message}")
-        logging.info(f"{address} - {message}")
 
-        for client in clients:
-            if client != address:
-                server.sendto(message.encode(), client)
+def handle_join(server: socket.socket, address: tuple[str, int], username: str) -> None:
+    """Mendaftarkan client baru ke daftar client aktif."""
+    if not is_valid_username(username):
+        send(server, address, "[SERVER] Username harus 3-20 karakter, hanya huruf/angka/underscore.")
+        return
 
-    except Exception as e:
-        print(f"[ERROR] {e}")
+    clients[address] = username
+    send(server, address, f"[SERVER] Berhasil bergabung sebagai {username}.")
+    broadcast(server, f"[SERVER] {username} bergabung ke UDP chat.", exclude=address)
+    logging.info("JOIN %s %s", username, address)
+    print(f"[JOIN] {username} dari {address}")
+
+
+def handle_message(server: socket.socket, address: tuple[str, int], username: str, text: str) -> None:
+    """Memvalidasi pesan, menyimpan log, lalu broadcast."""
+    if address not in clients:
+        send(server, address, "[SERVER] Anda belum join. Jalankan ulang client atau masukkan username.")
+        return
+
+    if clients[address] != username:
+        send(server, address, "[SERVER] Username tidak sesuai dengan alamat client.")
+        return
+
+    if not text.strip():
+        send(server, address, "[SERVER] Pesan tidak boleh kosong.")
+        return
+
+    if len(text) > MAX_MESSAGE_LENGTH:
+        send(server, address, f"[SERVER] Pesan maksimal {MAX_MESSAGE_LENGTH} karakter.")
+        return
+
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    formatted = f"[{timestamp}] {username}: {text.strip()}"
+    logging.info("CHAT %s %s", address, formatted)
+    print(formatted)
+    broadcast(server, formatted, exclude=address)
+
+
+def handle_list(server: socket.socket, address: tuple[str, int]) -> None:
+    """Menampilkan daftar user UDP yang aktif."""
+    online = sorted(set(clients.values()))
+    send(server, address, "[SERVER] User online: " + (", ".join(online) if online else "belum ada"))
+
+
+def handle_quit(server: socket.socket, address: tuple[str, int]) -> None:
+    """Menghapus client dari daftar aktif."""
+    username = clients.pop(address, None)
+    if username:
+        send(server, address, "[SERVER] Anda keluar dari UDP chat.")
+        broadcast(server, f"[SERVER] {username} keluar dari UDP chat.", exclude=address)
+        logging.info("QUIT %s %s", username, address)
+        print(f"[QUIT] {username} dari {address}")
+
+
+def parse_packet(packet: str) -> tuple[str, list[str]]:
+    """Format paket: JOIN|username, MSG|username|pesan, LIST, QUIT."""
+    parts = packet.strip().split("|", 2)
+    command = parts[0].upper() if parts else ""
+    return command, parts[1:]
+
+
+def run_server(host: str, port: int) -> None:
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as server:
+        server.bind((host, port))
+        print("=" * 55)
+        print(" UDP BROADCAST CHAT SERVER")
+        print("=" * 55)
+        print(f"Bind address : {host}:{port}")
+        print(f"IP lokal     : {get_local_ip()}")
+        print("Client lokal : python udp/udp_client.py --host 127.0.0.1")
+        print("Stop server  : CTRL + C")
+        print("=" * 55)
+
+        while True:
+            try:
+                data, address = server.recvfrom(BUFFER_SIZE)
+                packet = data.decode("utf-8", errors="replace").strip()
+                command, args = parse_packet(packet)
+
+                if command == "JOIN" and len(args) == 1:
+                    handle_join(server, address, args[0].strip())
+                elif command == "MSG" and len(args) == 2:
+                    handle_message(server, address, args[0].strip(), args[1])
+                elif command == "LIST":
+                    handle_list(server, address)
+                elif command == "QUIT":
+                    handle_quit(server, address)
+                else:
+                    send(server, address, "[SERVER] Format tidak valid. Gunakan client resmi atau command /help.")
+            except UnicodeDecodeError:
+                send(server, address, "[SERVER] Data harus berupa teks UTF-8.")
+            except KeyboardInterrupt:
+                print("\n[SERVER] UDP server dihentikan.")
+                break
+            except OSError as error:
+                print(f"[ERROR] Socket error: {error}")
+                logging.exception("Socket error")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="UDP Broadcast Chat Server")
+    parser.add_argument("--host", default=DEFAULT_HOST, help="Alamat bind server, default 0.0.0.0")
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="Port server, default 5000")
+    args = parser.parse_args()
+    run_server(args.host, args.port)
+
+
+if __name__ == "__main__":
+    main()
