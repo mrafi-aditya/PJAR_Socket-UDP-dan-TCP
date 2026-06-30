@@ -11,7 +11,7 @@ import re
 import socket
 import threading
 
-DEFAULT_HOST = "192.168.18.99"  # IP Ubuntu VirtualBox. Ubah via --host jika IP berubah.
+DEFAULT_HOST = "192.168.18.9"  # IP Ubuntu VirtualBox. Ubah via --host jika IP berubah.
 DEFAULT_PORT = 5000
 BUFFER_SIZE = 2048
 USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_]{3,20}$")
