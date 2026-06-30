@@ -1,15 +1,8 @@
-"""TCP Multi Client Chat Server.
+"""TCP Multi Client Chat Server untuk demo Socket Programming.
 
-Fitur:
-- Multi-client dengan threading.
-- Login username/password.
-- Chat real-time.
-- Command /list, /msg, /help, /quit.
-- Terima file dari client dan simpan ke folder received_files.
-- Logging ke logs/tcp_chat.log.
+Server dijalankan di Ubuntu VirtualBox, client bisa dijalankan dari Windows/host.
+File ini tidak membutuhkan protocol.py. Semua fungsi protocol JSON ada langsung di file ini.
 """
-
-from __future__ import annotations
 
 import argparse
 import base64
@@ -21,36 +14,12 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
-
-
-
-def send_json(sock: socket.socket, payload: dict) -> None:
-    """Mengirim data JSON lewat TCP tanpa file protocol.py.
-
-    TCP tidak punya batas pesan seperti UDP, jadi setiap JSON diakhiri newline.
-    Newline dipakai sebagai pemisah antar pesan agar penerima mudah membaca
-    satu pesan utuh per baris.
-    """
-    data = json.dumps(payload, ensure_ascii=False) + "\n"
-    sock.sendall(data.encode("utf-8"))
-
-
-def read_json_line(reader):
-    """Membaca satu baris JSON dari koneksi TCP.
-
-    Return None jika koneksi client/server terputus.
-    """
-    line = reader.readline()
-    if not line:
-        return None
-    return json.loads(line)
-
-
-DEFAULT_HOST = "0.0.0.0"  # Server menerima koneksi dari semua interface jaringan.
-DEFAULT_PORT = 6000
+HOST_DEFAULT = "0.0.0.0"
+PORT_DEFAULT = 6000
 MAX_MESSAGE_LENGTH = 1000
-MAX_FILE_SIZE = 2 * 1024 * 1024  # 2 MB agar aman untuk demo tugas.
+MAX_FILE_SIZE = 2 * 1024 * 1024  # 2 MB untuk demo agar aman.
 USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_]{3,20}$")
+LOGIN_PASSWORD = "123"
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 LOG_DIR = BASE_DIR / "logs"
@@ -64,35 +33,22 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
 
-USERS = {
-    "admin": "123",
-    "user1": "123",
-    "user2": "123",
-}
-
-clients: dict[str, socket.socket] = {}
-client_addresses: dict[str, tuple[str, int]] = {}
+# clients: username -> {"sock": socket, "lock": threading.Lock(), "address": address}
+clients = {}
 clients_lock = threading.Lock()
 
 
-def get_local_ip() -> str:
-    """Mengambil IP lokal server agar mudah dipakai client dari Windows/host.
-
-    Server tetap bind ke 0.0.0.0, sedangkan IP ini hanya ditampilkan
-    supaya client tahu alamat Ubuntu VirtualBox yang harus dituju.
-    """
-    candidates: list[str] = []
-
-    # Cara paling stabil untuk mengetahui IP interface aktif.
+def get_local_ip():
+    """Mencoba menampilkan IP aktif server agar mudah dipakai client."""
+    candidates = []
     for target in ("8.8.8.8", "1.1.1.1"):
         try:
-            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
-                probe.connect((target, 80))
-                candidates.append(probe.getsockname()[0])
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                sock.connect((target, 80))
+                candidates.append(sock.getsockname()[0])
         except OSError:
             pass
 
-    # Cadangan jika cara di atas gagal.
     try:
         hostname = socket.gethostname()
         for info in socket.getaddrinfo(hostname, None, socket.AF_INET):
@@ -106,77 +62,100 @@ def get_local_ip() -> str:
     return "127.0.0.1"
 
 
-def safe_filename(filename: str) -> str:
+def send_json(sock, payload):
+    """Mengirim satu paket JSON lewat TCP.
+
+    TCP adalah stream, jadi pesan dipisahkan dengan newline agar penerima tahu
+    batas akhir satu paket.
+    """
+    data = json.dumps(payload, ensure_ascii=False) + "\n"
+    sock.sendall(data.encode("utf-8"))
+
+
+def read_json_line(reader):
+    """Membaca satu baris JSON. Return None jika koneksi terputus."""
+    line = reader.readline()
+    if not line:
+        return None
+    return json.loads(line)
+
+
+def is_valid_username(username):
+    return bool(USERNAME_PATTERN.fullmatch(username or ""))
+
+
+def safe_filename(filename):
     """Membersihkan nama file agar tidak bisa keluar dari folder tujuan."""
-    name = Path(filename).name.strip() or "file_tanpa_nama"
+    name = Path(filename or "file_tanpa_nama").name.strip() or "file_tanpa_nama"
     return re.sub(r"[^A-Za-z0-9_.-]", "_", name)
 
 
-def send_to_user(username: str, payload: dict) -> bool:
-    """Mengirim payload ke user tertentu."""
+def send_to_user(username, payload):
+    """Mengirim pesan ke user tertentu. Return True jika berhasil."""
     with clients_lock:
-        sock = clients.get(username)
-    if not sock:
+        record = clients.get(username)
+
+    if not record:
         return False
+
     try:
-        send_json(sock, payload)
+        with record["lock"]:
+            send_json(record["sock"], payload)
         return True
     except OSError as error:
         print(f"[ERROR] Gagal mengirim ke {username}: {error}")
         return False
 
 
-def broadcast(payload: dict, exclude: str | None = None) -> None:
+def broadcast(payload, exclude=None):
     """Broadcast pesan ke semua client aktif."""
     with clients_lock:
-        online = list(clients.items())
+        usernames = list(clients.keys())
 
-    for username, sock in online:
-        if username == exclude:
+    for username in usernames:
+        if exclude is not None and username == exclude:
             continue
-        try:
-            send_json(sock, payload)
-        except OSError as error:
-            print(f"[ERROR] Broadcast gagal ke {username}: {error}")
+        send_to_user(username, payload)
 
 
-def online_users() -> list[str]:
+def online_users():
     with clients_lock:
         return sorted(clients.keys())
 
 
-def validate_login(username: str, password: str) -> tuple[bool, str]:
-    """Validasi login sederhana."""
-    if not USERNAME_PATTERN.match(username):
-        return False, "Username harus 3-20 karakter, hanya huruf/angka/underscore."
-    if USERS.get(username) != password:
-        return False, "Username atau password salah."
+def validate_login(username, password):
+    """Login sederhana: username bebas yang valid, password demo adalah 123."""
+    if not is_valid_username(username):
+        return False, "Username harus 3-20 karakter dan hanya huruf/angka/underscore."
+    if password != LOGIN_PASSWORD:
+        return False, "Password salah. Password demo: 123"
     with clients_lock:
         if username in clients:
-            return False, "Username sedang login di client lain."
+            return False, f"Username '{username}' sedang login di client lain."
     return True, "Login berhasil."
 
 
-def handle_chat(username: str, text: str) -> None:
-    """Memproses chat biasa dari client."""
-    text = text.strip()
-    if not text:
+def handle_chat(username, text):
+    clean_text = (text or "").strip()
+    if not clean_text:
         send_to_user(username, {"type": "error", "text": "Pesan tidak boleh kosong."})
         return
-    if len(text) > MAX_MESSAGE_LENGTH:
+    if len(clean_text) > MAX_MESSAGE_LENGTH:
         send_to_user(username, {"type": "error", "text": f"Pesan maksimal {MAX_MESSAGE_LENGTH} karakter."})
         return
 
     timestamp = datetime.now().strftime("%H:%M:%S")
-    message = f"[{timestamp}] {username}: {text}"
+    message = f"[{timestamp}] {username}: {clean_text}"
     print(message)
-    logging.info("CHAT %s", message)
+    logging.info("TCP CHAT %s", message)
     broadcast({"type": "chat", "text": message})
 
 
-def handle_private_message(username: str, target: str, text: str) -> None:
-    """Mengirim pesan private antar user."""
-    if not target or not text.strip():
+def handle_private_message(username, target, text):
+    target = (target or "").strip()
+    clean_text = (text or "").strip()
+
+    if not target or not clean_text:
         send_to_user(username, {"type": "error", "text": "Format: /msg username pesan"})
         return
     if target == username:
@@ -184,23 +163,22 @@ def handle_private_message(username: str, target: str, text: str) -> None:
         return
 
     timestamp = datetime.now().strftime("%H:%M:%S")
-    sent = send_to_user(target, {"type": "private", "text": f"[{timestamp}] [PM dari {username}] {text.strip()}"})
+    sent = send_to_user(target, {"type": "private", "text": f"[{timestamp}] [PM dari {username}] {clean_text}"})
     if sent:
-        send_to_user(username, {"type": "info", "text": f"[PM ke {target}] {text.strip()}"})
-        logging.info("PM %s -> %s: %s", username, target, text.strip())
+        send_to_user(username, {"type": "info", "text": f"[PM ke {target}] {clean_text}"})
+        logging.info("TCP PM %s -> %s: %s", username, target, clean_text)
     else:
-        send_to_user(username, {"type": "error", "text": f"User {target} tidak online."})
+        send_to_user(username, {"type": "error", "text": f"User '{target}' tidak online."})
 
 
-def handle_file(username: str, payload: dict) -> None:
-    """Menerima file base64 dari client lalu menyimpannya."""
+def handle_file(username, payload):
     filename = safe_filename(str(payload.get("filename", "file.txt")))
     content_b64 = payload.get("content_b64", "")
 
     try:
         content = base64.b64decode(content_b64, validate=True)
     except (ValueError, TypeError):
-        send_to_user(username, {"type": "error", "text": "File gagal dibaca: format base64 tidak valid."})
+        send_to_user(username, {"type": "error", "text": "File gagal dibaca: base64 tidak valid."})
         return
 
     if len(content) == 0:
@@ -218,13 +196,12 @@ def handle_file(username: str, payload: dict) -> None:
     size_kb = len(content) / 1024
     info = f"File '{filename}' dari {username} tersimpan sebagai '{saved_name}' ({size_kb:.1f} KB)."
     print(f"[FILE] {info}")
-    logging.info("FILE %s", info)
+    logging.info("TCP FILE %s", info)
     send_to_user(username, {"type": "info", "text": f"File berhasil dikirim: {saved_name}"})
     broadcast({"type": "info", "text": f"[SERVER] {username} mengirim file: {filename}"}, exclude=username)
 
 
-def send_help(username: str) -> None:
-    """Mengirim daftar command ke client."""
+def send_help(username):
     help_text = (
         "Command tersedia:\n"
         "  /help              : bantuan command\n"
@@ -236,29 +213,30 @@ def send_help(username: str) -> None:
     send_to_user(username, {"type": "info", "text": help_text})
 
 
-def cleanup_client(username: str | None) -> None:
-    """Menghapus client saat disconnect."""
+def cleanup_client(username):
+    """Menghapus client dari daftar online."""
     if not username:
         return
+
     with clients_lock:
-        sock = clients.pop(username, None)
-        client_addresses.pop(username, None)
-    if sock:
+        record = clients.pop(username, None)
+
+    if record:
         try:
-            sock.close()
+            record["sock"].close()
         except OSError:
             pass
+
     broadcast({"type": "info", "text": f"[SERVER] {username} keluar dari TCP chat."}, exclude=username)
-    logging.info("LOGOUT %s", username)
+    logging.info("TCP LOGOUT %s", username)
     print(f"[LOGOUT] {username}")
 
 
-def handle_client(conn: socket.socket, address: tuple[str, int]) -> None:
-    """Thread handler untuk satu client TCP."""
-    username: str | None = None
+def handle_client(conn, address):
+    username = None
     try:
         reader = conn.makefile("r", encoding="utf-8")
-        send_json(conn, {"type": "info", "text": "Silakan login menggunakan username dan password."})
+        send_json(conn, {"type": "info", "text": "Silakan login. Username bebas, password demo: 123"})
 
         login_payload = read_json_line(reader)
         if not login_payload or login_payload.get("type") != "login":
@@ -270,16 +248,16 @@ def handle_client(conn: socket.socket, address: tuple[str, int]) -> None:
         valid, message = validate_login(username, password)
         if not valid:
             send_json(conn, {"type": "auth", "status": "failed", "text": message})
+            username = None
             return
 
         with clients_lock:
-            clients[username] = conn
-            client_addresses[username] = address
+            clients[username] = {"sock": conn, "lock": threading.Lock(), "address": address}
 
         send_json(conn, {"type": "auth", "status": "ok", "text": message})
         send_help(username)
         broadcast({"type": "info", "text": f"[SERVER] {username} bergabung ke TCP chat."}, exclude=username)
-        logging.info("LOGIN %s %s", username, address)
+        logging.info("TCP LOGIN %s dari %s", username, address)
         print(f"[LOGIN] {username} dari {address}")
 
         while True:
@@ -292,13 +270,13 @@ def handle_client(conn: socket.socket, address: tuple[str, int]) -> None:
             if payload is None:
                 break
 
-            msg_type = payload.get("type")
+            msg_type = str(payload.get("type", "")).lower().strip()
             if msg_type == "chat":
-                handle_chat(username, str(payload.get("text", "")))
+                handle_chat(username, payload.get("text", ""))
             elif msg_type == "private":
-                handle_private_message(username, str(payload.get("target", "")).strip(), str(payload.get("text", "")))
+                handle_private_message(username, payload.get("target", ""), payload.get("text", ""))
             elif msg_type == "list":
-                send_to_user(username, {"type": "info", "text": "User online: " + ", ".join(online_users())})
+                send_to_user(username, {"type": "info", "text": "User online: " + (", ".join(online_users()) or "belum ada")})
             elif msg_type == "help":
                 send_help(username)
             elif msg_type == "file":
@@ -312,28 +290,27 @@ def handle_client(conn: socket.socket, address: tuple[str, int]) -> None:
         print(f"[DISCONNECT] Client {address} terputus tiba-tiba.")
     except OSError as error:
         print(f"[ERROR] Client {address}: {error}")
-        logging.exception("Client error")
+        logging.exception("TCP client error")
     finally:
         cleanup_client(username)
 
 
-def run_server(host: str, port: int) -> None:
+def run_server(host, port):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server.bind((host, port))
         server.listen(10)
 
-        print("=" * 55)
-        print(" TCP MULTI CLIENT CHAT SERVER")
-        print("=" * 55)
         local_ip = get_local_ip()
+        print("=" * 60)
+        print(" TCP MULTI CLIENT CHAT SERVER")
+        print("=" * 60)
         print(f"Bind address       : {host}:{port}")
         print(f"IP Ubuntu VBox     : {local_ip}")
         print(f"Client dari Windows: python tcp/tcp_client.py --host {local_ip} --port {port}")
-        print("Client di server   : python tcp/tcp_client.py --host 127.0.0.1")
-        print("Akun demo          : admin/123, user1/123, user2/123")
+        print("Login demo         : username bebas, password 123")
         print("Stop server        : CTRL + C")
-        print("=" * 55)
+        print("=" * 60)
 
         while True:
             try:
@@ -345,13 +322,13 @@ def run_server(host: str, port: int) -> None:
                 break
             except OSError as error:
                 print(f"[ERROR] Server error: {error}")
-                logging.exception("Server error")
+                logging.exception("TCP server error")
 
 
-def main() -> None:
+def main():
     parser = argparse.ArgumentParser(description="TCP Multi Client Chat Server")
-    parser.add_argument("--host", default=DEFAULT_HOST, help="Alamat bind server, default 0.0.0.0")
-    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="Port server, default 6000")
+    parser.add_argument("--host", default=HOST_DEFAULT, help="Alamat bind server, default 0.0.0.0")
+    parser.add_argument("--port", type=int, default=PORT_DEFAULT, help="Port server, default 6000")
     args = parser.parse_args()
     run_server(args.host, args.port)
 

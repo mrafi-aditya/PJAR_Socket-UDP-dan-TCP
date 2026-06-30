@@ -1,10 +1,7 @@
 """TCP Multi Client Chat Client.
 
-Default host diarahkan ke IP server Ubuntu VirtualBox.
-Jika IP VirtualBox berubah, jalankan client dengan opsi --host IP_SERVER.
+Client ini tidak membutuhkan protocol.py. Setelah login, user cukup mengetik pesan biasa.
 """
-
-from __future__ import annotations
 
 import argparse
 import base64
@@ -14,58 +11,39 @@ import socket
 import threading
 from pathlib import Path
 
+HOST_DEFAULT = "192.168.18.99"  # Ganti lewat --host jika IP Ubuntu VirtualBox berubah.
+PORT_DEFAULT = 6000
+MAX_FILE_SIZE = 2 * 1024 * 1024  # 2 MB
 
 
-
-def send_json(sock: socket.socket, payload: dict) -> None:
-    """Mengirim data JSON lewat TCP tanpa file protocol.py.
-
-    TCP tidak punya batas pesan seperti UDP, jadi setiap JSON diakhiri newline.
-    Newline dipakai sebagai pemisah antar pesan agar penerima mudah membaca
-    satu pesan utuh per baris.
-    """
+def send_json(sock, payload):
+    """Mengirim satu paket JSON lewat TCP dengan pemisah newline."""
     data = json.dumps(payload, ensure_ascii=False) + "\n"
     sock.sendall(data.encode("utf-8"))
 
 
 def read_json_line(reader):
-    """Membaca satu baris JSON dari koneksi TCP.
-
-    Return None jika koneksi client/server terputus.
-    """
+    """Membaca satu baris JSON. Return None jika koneksi terputus."""
     line = reader.readline()
     if not line:
         return None
     return json.loads(line)
 
 
-DEFAULT_HOST = "192.168.18.99"  # IP Ubuntu VirtualBox. Ubah via --host jika IP berubah.
-DEFAULT_PORT = 6000
-MAX_FILE_SIZE = 2 * 1024 * 1024  # 2 MB
-
-
-def print_server_message(payload: dict) -> None:
-    """Menampilkan pesan server dengan format CLI yang rapi."""
+def print_server_message(payload):
     msg_type = payload.get("type", "info")
     text = payload.get("text", "")
 
     if msg_type == "error":
-        prefix = "[ERROR]"
+        print(f"\n[ERROR] {text}\n> ", end="")
     elif msg_type == "private":
-        prefix = "[PRIVATE]"
-    elif msg_type == "chat":
-        prefix = ""
-    else:
-        prefix = "[INFO]"
-
-    if prefix:
-        print(f"\n{prefix} {text}\n> ", end="")
+        print(f"\n[PRIVATE] {text}\n> ", end="")
     else:
         print(f"\n{text}\n> ", end="")
 
 
-def receive_messages(reader, stop_event: threading.Event) -> None:
-    """Thread penerima pesan dari server."""
+def receive_messages(reader, stop_event):
+    """Thread penerima pesan server agar user tetap bisa mengetik."""
     while not stop_event.is_set():
         try:
             payload = read_json_line(reader)
@@ -74,15 +52,21 @@ def receive_messages(reader, stop_event: threading.Event) -> None:
                 stop_event.set()
                 break
             print_server_message(payload)
+        except json.JSONDecodeError:
+            print("\n[CLIENT] Menerima data tidak valid dari server.")
+        except OSError:
+            stop_event.set()
+            break
         except Exception as error:
             print(f"\n[CLIENT] Error menerima pesan: {error}")
             stop_event.set()
             break
 
 
-def send_file(sock: socket.socket, filepath: str) -> None:
-    """Membaca file lokal dan mengirimkannya ke server."""
-    path = Path(filepath).expanduser()
+def send_file(sock, filepath):
+    """Membaca file lokal lalu mengirimnya ke server."""
+    cleaned_path = filepath.strip().strip('"').strip("'")
+    path = Path(cleaned_path).expanduser()
 
     if not path.is_file():
         print("[CLIENT] File tidak ditemukan.")
@@ -106,7 +90,7 @@ def send_file(sock: socket.socket, filepath: str) -> None:
     print(f"[CLIENT] Mengirim file {path.name} ({size / 1024:.1f} KB).")
 
 
-def run_client(host: str, port: int) -> None:
+def run_client(host, port):
     stop_event = threading.Event()
 
     try:
@@ -118,29 +102,37 @@ def run_client(host: str, port: int) -> None:
     with sock:
         reader = sock.makefile("r", encoding="utf-8")
 
-        welcome = read_json_line(reader)
-        if welcome:
-            print_server_message(welcome)
+        try:
+            welcome = read_json_line(reader)
+            if welcome:
+                print_server_message(welcome)
+        except (json.JSONDecodeError, OSError):
+            print("[CLIENT] Server mengirim data awal yang tidak valid.")
+            return
 
         username = input("Username: ").strip()
-        password = getpass.getpass("Password: ").strip()
-        send_json(sock, {"type": "login", "username": username, "password": password})
+        password = getpass.getpass("Password demo (123): ").strip()
 
-        auth = read_json_line(reader)
+        try:
+            send_json(sock, {"type": "login", "username": username, "password": password})
+            auth = read_json_line(reader)
+        except (json.JSONDecodeError, OSError) as error:
+            print(f"[CLIENT] Login gagal: {error}")
+            return
+
         if not auth or auth.get("status") != "ok":
             reason = auth.get("text", "Login gagal.") if auth else "Server tidak merespons."
             print(f"[CLIENT] {reason}")
             return
 
         print(f"[CLIENT] {auth.get('text')}")
-        print("Ketik /help untuk melihat command. Ketik /quit untuk keluar.")
+        print("Ketik /help untuk command. Ketik /quit untuk keluar.")
 
         threading.Thread(target=receive_messages, args=(reader, stop_event), daemon=True).start()
 
         while not stop_event.is_set():
             try:
                 message = input("> ").strip()
-
                 if not message:
                     print("[CLIENT] Pesan tidak boleh kosong.")
                     continue
@@ -156,7 +148,7 @@ def run_client(host: str, port: int) -> None:
                     else:
                         send_json(sock, {"type": "private", "target": parts[1], "text": parts[2]})
                 elif message.startswith("/sendfile "):
-                    filepath = message.split(" ", 1)[1].strip().strip('"')
+                    filepath = message.split(" ", 1)[1]
                     send_file(sock, filepath)
                 elif message == "/quit":
                     send_json(sock, {"type": "quit"})
@@ -166,7 +158,10 @@ def run_client(host: str, port: int) -> None:
                     send_json(sock, {"type": "chat", "text": message})
             except KeyboardInterrupt:
                 print("\n[CLIENT] Keluar dari TCP chat.")
-                send_json(sock, {"type": "quit"})
+                try:
+                    send_json(sock, {"type": "quit"})
+                except OSError:
+                    pass
                 stop_event.set()
                 break
             except OSError as error:
@@ -175,10 +170,10 @@ def run_client(host: str, port: int) -> None:
                 break
 
 
-def main() -> None:
+def main():
     parser = argparse.ArgumentParser(description="TCP Multi Client Chat Client")
-    parser.add_argument("--host", default=DEFAULT_HOST, help="IP server Ubuntu VirtualBox, default 192.168.18.99")
-    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="Port server, default 6000")
+    parser.add_argument("--host", default=HOST_DEFAULT, help="IP server Ubuntu VirtualBox")
+    parser.add_argument("--port", type=int, default=PORT_DEFAULT, help="Port server, default 6000")
     args = parser.parse_args()
     run_client(args.host, args.port)
 
