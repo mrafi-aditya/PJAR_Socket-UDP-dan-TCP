@@ -1,10 +1,11 @@
-"""UDP Broadcast Chat Server
+"""UDP Broadcast Chat Server.
 
 Fitur:
 - Menerima banyak client UDP.
 - Broadcast pesan ke semua client aktif.
 - Logging pesan ke file logs/udp_chat.log.
 - Validasi username dan pesan.
+- Server bind ke 0.0.0.0 agar bisa diakses dari Windows/host ketika berjalan di VirtualBox.
 """
 
 import argparse
@@ -14,7 +15,7 @@ import socket
 from datetime import datetime
 from pathlib import Path
 
-DEFAULT_HOST = "0.0.0.0"  # Server menerima koneksi dari semua interface jaringan.
+DEFAULT_HOST = "0.0.0.0"  # Server menerima paket dari semua interface jaringan.
 DEFAULT_PORT = 5000
 BUFFER_SIZE = 2048
 MAX_MESSAGE_LENGTH = 500
@@ -30,18 +31,14 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
 
+# Key: alamat UDP client, Value: username.
 clients: dict[tuple[str, int], str] = {}
 
 
 def get_local_ip() -> str:
-    """Mengambil IP lokal server agar mudah dipakai client dari Windows/host.
-
-    Server tetap bind ke 0.0.0.0, sedangkan IP ini hanya ditampilkan
-    supaya client tahu alamat Ubuntu VirtualBox yang harus dituju.
-    """
+    """Mengambil IP lokal server untuk memudahkan client dari Windows/host."""
     candidates: list[str] = []
 
-    # Cara paling stabil untuk mengetahui IP interface aktif.
     for target in ("8.8.8.8", "1.1.1.1"):
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
@@ -50,7 +47,6 @@ def get_local_ip() -> str:
         except OSError:
             pass
 
-    # Cadangan jika cara di atas gagal.
     try:
         hostname = socket.gethostname()
         for info in socket.getaddrinfo(hostname, None, socket.AF_INET):
@@ -73,7 +69,7 @@ def send(server: socket.socket, address: tuple[str, int], message: str) -> None:
 
 
 def broadcast(server: socket.socket, message: str, exclude: tuple[str, int] | None = None) -> None:
-    """Mengirim pesan ke semua client, kecuali alamat tertentu jika ada."""
+    """Mengirim pesan ke semua client, kecuali alamat tertentu jika diisi."""
     for address in list(clients.keys()):
         if address == exclude:
             continue
@@ -81,7 +77,8 @@ def broadcast(server: socket.socket, message: str, exclude: tuple[str, int] | No
 
 
 def is_valid_username(username: str) -> bool:
-    return bool(USERNAME_PATTERN.match(username))
+    """Username hanya boleh huruf, angka, dan underscore sepanjang 3-20 karakter."""
+    return bool(USERNAME_PATTERN.fullmatch(username))
 
 
 def handle_join(server: socket.socket, address: tuple[str, int], username: str) -> None:
@@ -90,7 +87,14 @@ def handle_join(server: socket.socket, address: tuple[str, int], username: str) 
         send(server, address, "[SERVER] Username harus 3-20 karakter, hanya huruf/angka/underscore.")
         return
 
+    old_username = clients.get(address)
     clients[address] = username
+
+    if old_username and old_username != username:
+        send(server, address, f"[SERVER] Username diganti dari {old_username} menjadi {username}.")
+        logging.info("REJOIN %s -> %s %s", old_username, username, address)
+        return
+
     send(server, address, f"[SERVER] Berhasil bergabung sebagai {username}.")
     broadcast(server, f"[SERVER] {username} bergabung ke UDP chat.", exclude=address)
     logging.info("JOIN %s %s", username, address)
@@ -100,23 +104,24 @@ def handle_join(server: socket.socket, address: tuple[str, int], username: str) 
 def handle_message(server: socket.socket, address: tuple[str, int], username: str, text: str) -> None:
     """Memvalidasi pesan, menyimpan log, lalu broadcast."""
     if address not in clients:
-        send(server, address, "[SERVER] Anda belum join. Jalankan ulang client atau masukkan username.")
+        send(server, address, "[SERVER] Anda belum join. Jalankan ulang client lalu masukkan username.")
         return
 
     if clients[address] != username:
-        send(server, address, "[SERVER] Username tidak sesuai dengan alamat client.")
+        send(server, address, "[SERVER] Username tidak sesuai dengan client yang sudah join.")
         return
 
-    if not text.strip():
+    clean_text = text.strip()
+    if not clean_text:
         send(server, address, "[SERVER] Pesan tidak boleh kosong.")
         return
 
-    if len(text) > MAX_MESSAGE_LENGTH:
+    if len(clean_text) > MAX_MESSAGE_LENGTH:
         send(server, address, f"[SERVER] Pesan maksimal {MAX_MESSAGE_LENGTH} karakter.")
         return
 
     timestamp = datetime.now().strftime("%H:%M:%S")
-    formatted = f"[{timestamp}] {username}: {text.strip()}"
+    formatted = f"[{timestamp}] {username}: {clean_text}"
     logging.info("CHAT %s %s", address, formatted)
     print(formatted)
     broadcast(server, formatted, exclude=address)
@@ -139,30 +144,58 @@ def handle_quit(server: socket.socket, address: tuple[str, int]) -> None:
 
 
 def parse_packet(packet: str) -> tuple[str, list[str]]:
-    """Format paket: JOIN|username, MSG|username|pesan, LIST, QUIT."""
+    """Membaca format paket: JOIN|username, MSG|username|pesan, LIST, QUIT."""
     parts = packet.strip().split("|", 2)
     command = parts[0].upper() if parts else ""
     return command, parts[1:]
 
 
+def handle_legacy_message(server: socket.socket, address: tuple[str, int], packet: str) -> bool:
+    """Cadangan agar server tetap bisa menerima pesan biasa dari client lama.
+
+    Contoh yang didukung:
+    - Jika client sudah JOIN: "halo" akan dikirim atas nama username yang tersimpan.
+    - Jika belum JOIN: "Adit: halo" akan otomatis mendaftarkan Adit lalu mengirim pesan.
+    """
+    if address in clients:
+        handle_message(server, address, clients[address], packet)
+        return True
+
+    if ":" in packet:
+        username, text = packet.split(":", 1)
+        username = username.strip()
+        if is_valid_username(username):
+            handle_join(server, address, username)
+            handle_message(server, address, username, text)
+            return True
+
+    return False
+
+
 def run_server(host: str, port: int) -> None:
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as server:
         server.bind((host, port))
-        print("=" * 55)
-        print(" UDP BROADCAST CHAT SERVER")
-        print("=" * 55)
         local_ip = get_local_ip()
+
+        print("=" * 60)
+        print(" UDP BROADCAST CHAT SERVER")
+        print("=" * 60)
         print(f"Bind address       : {host}:{port}")
         print(f"IP Ubuntu VBox     : {local_ip}")
         print(f"Client dari Windows: python udp/udp_client.py --host {local_ip} --port {port}")
-        print("Client di server   : python udp/udp_client.py --host 127.0.0.1")
+        print("Client di server   : python3 udp/udp_client.py --host 127.0.0.1")
         print("Stop server        : CTRL + C")
-        print("=" * 55)
+        print("=" * 60)
 
         while True:
             try:
                 data, address = server.recvfrom(BUFFER_SIZE)
                 packet = data.decode("utf-8", errors="replace").strip()
+
+                if not packet:
+                    send(server, address, "[SERVER] Pesan tidak boleh kosong.")
+                    continue
+
                 command, args = parse_packet(packet)
 
                 if command == "JOIN" and len(args) == 1:
@@ -173,10 +206,12 @@ def run_server(host: str, port: int) -> None:
                     handle_list(server, address)
                 elif command == "QUIT":
                     handle_quit(server, address)
+                elif handle_legacy_message(server, address, packet):
+                    # Sudah ditangani sebagai pesan biasa/client lama.
+                    pass
                 else:
-                    send(server, address, "[SERVER] Format tidak valid. Gunakan client resmi atau command /help.")
-            except UnicodeDecodeError:
-                send(server, address, "[SERVER] Data harus berupa teks UTF-8.")
+                    send(server, address, "[SERVER] Format tidak valid. Jalankan ulang client resmi lalu masukkan username.")
+
             except KeyboardInterrupt:
                 print("\n[SERVER] UDP server dihentikan.")
                 break

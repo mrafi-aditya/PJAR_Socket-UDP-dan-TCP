@@ -1,7 +1,9 @@
 """UDP Broadcast Chat Client.
 
-Default host diarahkan ke IP server Ubuntu VirtualBox.
-Jika IP VirtualBox berubah, jalankan client dengan opsi --host IP_SERVER.
+Skenario penggunaan:
+- Server UDP dijalankan di Ubuntu VirtualBox.
+- Client UDP bisa dijalankan dari Windows/host atau Ubuntu.
+- Setelah memasukkan username, user cukup mengetik isi pesan saja.
 """
 
 import argparse
@@ -16,15 +18,17 @@ USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_]{3,20}$")
 
 
 def is_valid_username(username: str) -> bool:
-    return bool(USERNAME_PATTERN.match(username))
+    """Validasi username agar rapi dan aman untuk ditampilkan di chat."""
+    return bool(USERNAME_PATTERN.fullmatch(username))
 
 
 def receive_messages(client: socket.socket, stop_event: threading.Event) -> None:
-    """Thread penerima pesan dari server."""
+    """Menerima pesan dari server secara paralel agar client tetap bisa mengetik."""
     while not stop_event.is_set():
         try:
             data, _ = client.recvfrom(BUFFER_SIZE)
-            print(f"\n{data.decode('utf-8', errors='replace')}\n> ", end="")
+            message = data.decode("utf-8", errors="replace")
+            print(f"\n{message}\n> ", end="")
         except OSError:
             break
 
@@ -32,21 +36,22 @@ def receive_messages(client: socket.socket, stop_event: threading.Event) -> None
 def run_client(host: str, port: int) -> None:
     username = input("Masukkan username (3-20 huruf/angka/_): ").strip()
     if not is_valid_username(username):
-        print("[CLIENT] Username tidak valid.")
+        print("[CLIENT] Username tidak valid. Gunakan 3-20 huruf/angka/underscore.")
         return
 
     server_address = (host, port)
     stop_event = threading.Event()
 
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client:
-        client.settimeout(1.0)
+        # Timeout hanya dipakai saat proses JOIN agar tidak menunggu selamanya.
+        client.settimeout(3.0)
 
         try:
             client.sendto(f"JOIN|{username}".encode("utf-8"), server_address)
             data, _ = client.recvfrom(BUFFER_SIZE)
             print(data.decode("utf-8", errors="replace"))
         except socket.timeout:
-            print("[CLIENT] Server tidak merespons. Pastikan UDP server sudah berjalan.")
+            print("[CLIENT] Server tidak merespons. Pastikan UDP server sudah berjalan dan IP/port benar.")
             return
         except OSError as error:
             print(f"[CLIENT] Gagal konek ke server: {error}")
@@ -59,7 +64,8 @@ def run_client(host: str, port: int) -> None:
         print("  /list  : lihat user online")
         print("  /quit  : keluar")
         print("  /help  : bantuan")
-        print("Ketik pesan biasa untuk broadcast UDP. Format server: username: pesan")
+        print("\nKetik pesan biasa saja. Contoh: halo semuanya")
+        print("Username sudah otomatis dikirim oleh program.")
 
         while True:
             try:
@@ -70,7 +76,7 @@ def run_client(host: str, port: int) -> None:
                     continue
 
                 if message == "/help":
-                    print("Command: /list, /quit, atau ketik pesan biasa.")
+                    print("Command: /list, /quit, /help, atau langsung ketik isi pesan.")
                     continue
 
                 if message == "/list":
@@ -82,9 +88,14 @@ def run_client(host: str, port: int) -> None:
                     stop_event.set()
                     break
 
+                # Client mengirim username otomatis, jadi user cukup mengetik isi pesan.
                 client.sendto(f"MSG|{username}|{message}".encode("utf-8"), server_address)
+
             except KeyboardInterrupt:
-                client.sendto(b"QUIT", server_address)
+                try:
+                    client.sendto(b"QUIT", server_address)
+                except OSError:
+                    pass
                 stop_event.set()
                 print("\n[CLIENT] Keluar dari UDP chat.")
                 break
